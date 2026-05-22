@@ -2,10 +2,13 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import asyncio
 import base64
 import json
 import mimetypes
 import re
+import time
+import uuid
 from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -20,6 +23,7 @@ from ..core.models import (
     ChatMessage,
     GeminiContent,
     GeminiGenerateContentRequest,
+    Task,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
 from ..services.browser_captcha_extension import ExtensionCaptchaService
@@ -529,6 +533,95 @@ def _build_openai_json_response(payload: Dict[str, Any]) -> JSONResponse:
     return JSONResponse(content=payload, status_code=_get_error_status_code(payload))
 
 
+def _bridge_video_payload(task: Task) -> Dict[str, Any]:
+    status_map = {
+        "processing": "in_progress",
+        "completed": "completed",
+        "failed": "failed",
+    }
+    status = status_map.get(task.status, "queued")
+    payload: Dict[str, Any] = {
+        "id": task.task_id,
+        "object": "video",
+        "model": task.model,
+        "status": status,
+        "progress": task.progress,
+    }
+    if task.result_urls:
+        payload["url"] = task.result_urls[0]
+    if task.error_message:
+        payload["error"] = {
+            "message": task.error_message,
+            "code": "generation_failed",
+        }
+    if task.created_at:
+        payload["created_at"] = int(task.created_at.timestamp())
+    if task.completed_at:
+        payload["completed_at"] = int(task.completed_at.timestamp())
+    return payload
+
+
+async def _run_bridge_video_task(
+    bridge_task_id: str,
+    normalized: NormalizedGenerationRequest,
+    base_url_override: Optional[str],
+) -> None:
+    handler = _ensure_generation_handler()
+    try:
+        payload = _enrich_payload_with_direct_url(
+            _parse_handler_result(
+                await _collect_non_stream_result(
+                    normalized.model,
+                    normalized.prompt,
+                    normalized.images,
+                    base_url_override=base_url_override,
+                    video_media_id=normalized.video_media_id,
+                )
+            )
+        )
+        if "error" in payload:
+            error = payload.get("error") or {}
+            await handler.db.update_task(
+                bridge_task_id,
+                status="failed",
+                progress=100,
+                error_message=str(error.get("message") or payload),
+                completed_at=time.time(),
+            )
+            return
+
+        url = _extract_url_from_openai_payload(payload)
+        if not url:
+            await handler.db.update_task(
+                bridge_task_id,
+                status="failed",
+                progress=100,
+                error_message="Flow2API bridge generation completed without a video URL",
+                completed_at=time.time(),
+            )
+            return
+
+        await handler.db.update_task(
+            bridge_task_id,
+            status="completed",
+            progress=100,
+            result_urls=[url],
+            completed_at=time.time(),
+        )
+    except Exception as exc:
+        debug_logger.log_error(f"[Bridge] video task {bridge_task_id} failed: {exc}")
+        try:
+            await handler.db.update_task(
+                bridge_task_id,
+                status="failed",
+                progress=100,
+                error_message=str(exc),
+                completed_at=time.time(),
+            )
+        except Exception as update_exc:
+            debug_logger.log_error(f"[Bridge] failed to update task {bridge_task_id}: {update_exc}")
+
+
 def _build_gemini_error_payload(status_code: int, message: str) -> Dict[str, Any]:
     return {
         "error": {
@@ -817,6 +910,73 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
             }
         )
     return {"object": "list", "data": alias_models}
+
+
+@router.post("/api/bridge/videos")
+async def create_bridge_video(
+    request: ChatCompletionRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Submit an async Flow video task for gateway sidecars.
+
+    The normal OpenAI-compatible endpoint waits for the final media. This bridge
+    endpoint returns immediately so an upstream gateway can own user-facing task
+    IDs, billing, and polling while Flow2API keeps token/captcha/credits logic.
+    """
+    try:
+        normalized = await _normalize_openai_request(request)
+        if not normalized.prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        model_config = MODEL_CONFIG.get(normalized.model)
+        if not model_config or model_config.get("type") != "video":
+            raise HTTPException(status_code=400, detail=f"Model is not a video model: {normalized.model}")
+
+        handler = _ensure_generation_handler()
+        bridge_task_id = f"flow2api_task_{uuid.uuid4().hex}"
+        await handler.db.create_task(
+            Task(
+                task_id=bridge_task_id,
+                token_id=0,
+                model=normalized.model,
+                prompt=normalized.prompt,
+                status="processing",
+                progress=0,
+            )
+        )
+        asyncio.create_task(
+            _run_bridge_video_task(
+                bridge_task_id,
+                normalized,
+                _get_request_base_url(raw_request),
+            )
+        )
+        task = await handler.db.get_task(bridge_task_id)
+        return JSONResponse(content=_bridge_video_payload(task))
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(exc), "status_code": 500}},
+        )
+
+
+@router.get("/api/bridge/videos/{task_id}")
+async def get_bridge_video(
+    task_id: str,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Fetch a bridge video task submitted through /api/bridge/videos."""
+    handler = _ensure_generation_handler()
+    task = await handler.db.get_task(task_id)
+    if not task:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": "Task not found", "status_code": 404}},
+        )
+    return JSONResponse(content=_bridge_video_payload(task))
 
 
 @router.get("/v1beta/models")
