@@ -679,6 +679,76 @@ def _enrich_payload_with_direct_url(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _extract_bridge_image_uri(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        uri = value.strip()
+        return uri or None
+    if not isinstance(value, dict):
+        return None
+
+    image_url = value.get("image_url")
+    if isinstance(image_url, str):
+        return image_url.strip() or None
+    if isinstance(image_url, dict):
+        uri = image_url.get("url")
+        if isinstance(uri, str):
+            return uri.strip() or None
+
+    uri = value.get("url")
+    if isinstance(uri, str):
+        return uri.strip() or None
+    return None
+
+
+def _extract_bridge_image_uris(raw: Dict[str, Any]) -> List[str]:
+    uris: List[str] = []
+    for key in ("image", "mask"):
+        uri = _extract_bridge_image_uri(raw.get(key))
+        if uri:
+            uris.append(uri)
+
+    images = raw.get("images")
+    if isinstance(images, list):
+        for item in images:
+            uri = _extract_bridge_image_uri(item)
+            if uri:
+                uris.append(uri)
+    else:
+        uri = _extract_bridge_image_uri(images)
+        if uri:
+            uris.append(uri)
+
+    return uris
+
+
+def _build_bridge_chat_request(raw: Dict[str, Any], image_uris: List[str]) -> ChatCompletionRequest:
+    content: List[Dict[str, Any]] = []
+    prompt = str(raw.get("prompt") or "").strip()
+    if prompt:
+        content.append({"type": "text", "text": prompt})
+    for uri in image_uris:
+        content.append({"type": "image_url", "image_url": {"url": uri}})
+
+    request_fields = {
+        "model": str(raw.get("model") or "").strip(),
+        "messages": [ChatMessage(role="user", content=content or prompt)],
+        "stream": False,
+        "generationConfig": raw.get("generationConfig"),
+    }
+    for key in ("size", "quality", "aspect_ratio", "aspectRatio", "image_size", "imageSize"):
+        if key in raw:
+            request_fields[key] = raw.get(key)
+
+    return ChatCompletionRequest(**request_fields)
+
+
+async def _build_bridge_image_data_item(url: str, response_format: str) -> Dict[str, Any]:
+    if response_format == "b64_json":
+        image_bytes = await _load_image_bytes_from_uri(url)
+        return {"b64_json": base64.b64encode(image_bytes).decode("ascii")}
+    return {"url": url}
+
+
 async def _build_image_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
     if uri.startswith("data:image"):
         mime_type, _ = _decode_data_url(uri)
@@ -910,6 +980,77 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
             }
         )
     return {"object": "list", "data": alias_models}
+
+
+@router.post("/api/bridge/images")
+async def create_bridge_image(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Generate Flow images through an OpenAI Images compatible sidecar bridge."""
+    try:
+        raw = await raw_request.json()
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+        image_uris = _extract_bridge_image_uris(raw)
+        normalized = await _normalize_openai_request(_build_bridge_chat_request(raw, image_uris))
+        if not normalized.prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        model_config = MODEL_CONFIG.get(normalized.model)
+        if not model_config or model_config.get("type") != "image":
+            raise HTTPException(status_code=400, detail=f"Model is not an image model: {normalized.model}")
+
+        response_format = str(raw.get("response_format") or "url").strip().lower()
+        if response_format not in {"url", "b64_json"}:
+            raise HTTPException(status_code=400, detail="response_format must be url or b64_json")
+
+        try:
+            count = int(raw.get("n") or 1)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="n must be an integer")
+        count = max(1, min(count, 4))
+
+        data: List[Dict[str, Any]] = []
+        for _ in range(count):
+            payload = _enrich_payload_with_direct_url(
+                _parse_handler_result(
+                    await _collect_non_stream_result(
+                        normalized.model,
+                        normalized.prompt,
+                        normalized.images,
+                        base_url_override=_get_request_base_url(raw_request),
+                    )
+                )
+            )
+            if "error" in payload:
+                return _build_openai_json_response(payload)
+
+            url = _extract_url_from_openai_payload(payload)
+            if not url:
+                raise HTTPException(status_code=500, detail="Flow2API image generation completed without an image URL")
+
+            item = await _build_bridge_image_data_item(url, response_format)
+            content = _extract_openai_message_content(payload)
+            if content:
+                item["revised_prompt"] = content
+            data.append(item)
+
+        return JSONResponse(
+            content={
+                "created": int(time.time()),
+                "data": data,
+                "model": normalized.model,
+            }
+        )
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": str(exc), "status_code": 500}},
+        )
 
 
 @router.post("/api/bridge/videos")
